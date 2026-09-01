@@ -759,7 +759,7 @@ func Test_SortedLabels(t *testing.T) {
 }
 
 // Test_TooManyColumnsPanic reproduces a panic that occurs when the Parquet file
-// would exceed the maximum number of columns supported by parquet-go (around 32k).
+// would exceed the maximum number of columns supported by parquet-go.
 // This catches a bug where the conversion did not correctly release resources on errors
 // during schema building, leading to a deadlock. If the column limit issue is fixed,
 // this test should be updated to still trigger an error during schema building that leads to
@@ -774,7 +774,7 @@ func Test_TooManyColumnsPanic(t *testing.T) {
 	t.Cleanup(func() { _ = bkt.Close() })
 
 	// Just a single series, but with too many columns
-	const tooManyColumns = 33000
+	const tooManyColumns = parquet.MaxColumnIndex + 2
 	app := st.Appender(ctx)
 	lbls := make([]string, tooManyColumns*2)
 	for i := range tooManyColumns {

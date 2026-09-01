@@ -44,6 +44,10 @@ func (c ConcreteChunksSeries) Iterator(_ chunks.Iterator) chunks.Iterator {
 	return prom_storage.NewListChunkSeriesIterator(c.chks...)
 }
 
+func (c ConcreteChunksSeries) IteratorFactory() prom_storage.ChunkIterable {
+	return c
+}
+
 type ChunkSeriesSetCloser interface {
 	prom_storage.ChunkSeriesSet
 

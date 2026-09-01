@@ -15,9 +15,11 @@ package schema
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/storage"
@@ -76,12 +78,14 @@ load_with_nhcb 1m
 		require.NoError(t, indexr.Series(p.At(), &builder, &chks))
 		totalSamples := 0
 		decodedSamples := 0
+		decodedChunks := []chunks.Meta{}
 		for i, chk := range chks {
 			c, _, err := cr.ChunkOrIterable(chk)
 			require.NoError(t, err)
 			chks[i].Chunk = c
 			totalSamples += c.NumSamples()
 		}
+		wantSamples := collectChunkSamples(t, chks)
 		decodedChunksByTime, err := enc.Encode(storage.NewListChunkSeriesIterator(chks...))
 		require.NoError(t, err)
 		for _, chunksByTime := range decodedChunksByTime {
@@ -91,9 +95,50 @@ load_with_nhcb 1m
 				require.LessOrEqual(t, decodedChunk.Chunk.NumSamples(), maxSamplesPerChunk)
 				decodedSamples += decodedChunk.Chunk.NumSamples()
 			}
+			decodedChunks = append(decodedChunks, decodedChunkMeta...)
 		}
 		require.Equal(t, totalSamples, decodedSamples)
+		require.ElementsMatch(t, wantSamples, collectChunkSamples(t, decodedChunks))
 	}
+}
+
+type chunkSample struct {
+	valueType chunkenc.ValueType
+	startTime int64
+	time      int64
+	valueBits uint64
+	histogram string
+}
+
+func collectChunkSamples(t *testing.T, chks []chunks.Meta) []chunkSample {
+	t.Helper()
+
+	samples := make([]chunkSample, 0)
+	for _, chk := range chks {
+		it := chk.Chunk.Iterator(nil)
+		for valueType := it.Next(); valueType != chunkenc.ValNone; valueType = it.Next() {
+			sample := chunkSample{valueType: valueType, startTime: it.AtST()}
+			switch valueType {
+			case chunkenc.ValFloat:
+				var value float64
+				sample.time, value = it.At()
+				sample.valueBits = math.Float64bits(value)
+			case chunkenc.ValHistogram:
+				var value *histogram.Histogram
+				sample.time, value = it.AtHistogram(nil)
+				sample.histogram = value.String()
+			case chunkenc.ValFloatHistogram:
+				var value *histogram.FloatHistogram
+				sample.time, value = it.AtFloatHistogram(nil)
+				sample.histogram = value.String()
+			default:
+				t.Fatalf("unexpected value type %v", valueType)
+			}
+			samples = append(samples, sample)
+		}
+		require.NoError(t, it.Err())
+	}
+	return samples
 }
 
 func generateHistogram(t *testing.T, app storage.Appender) {
