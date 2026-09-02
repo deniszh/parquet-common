@@ -15,6 +15,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -36,6 +37,26 @@ import (
 	"github.com/prometheus-community/parquet-common/storage"
 	"github.com/prometheus-community/parquet-common/util"
 )
+
+func TestNoChunksConcreteLabelsSeriesSetCallsMaterializedSeriesCallback(t *testing.T) {
+	wantErr := errors.New("limit exceeded")
+	called := 0
+	set := newNoChunksConcreteLabelsSeriesSet(context.Background(), []labels.Labels{
+		labels.FromStrings("series", "one"),
+		labels.FromStrings("series", "two"),
+	}, func(_ context.Context, _ prom_storage.ChunkSeries) error {
+		called++
+		if called == 2 {
+			return wantErr
+		}
+		return nil
+	})
+
+	require.True(t, set.Next())
+	require.False(t, set.Next())
+	require.ErrorIs(t, set.Err(), wantErr)
+	require.Equal(t, 2, called)
+}
 
 func TestMaterializeE2E(t *testing.T) {
 	st := teststorage.New(t)

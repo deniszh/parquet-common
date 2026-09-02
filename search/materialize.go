@@ -162,7 +162,7 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 	seriesSetLabels, rr := m.FilterSeriesLabels(ctx, hints, sLbls, rr)
 
 	if skipChunks {
-		return NewNoChunksConcreteLabelsSeriesSet(seriesSetLabels), nil
+		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
 	}
 
 	chksIter, err := m.MaterializeChunks(ctx, rgi, mint, maxt, rr)

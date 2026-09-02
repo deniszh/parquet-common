@@ -58,18 +58,27 @@ type ChunkSeriesSetCloser interface {
 }
 
 type NoChunksConcreteLabelsSeriesSet struct {
+	ctx              context.Context
 	seriesSet        []*ConcreteChunksSeries
 	currentSeriesIdx int
+	callback         MaterializedSeriesFunc
+	err              error
 }
 
 func NewNoChunksConcreteLabelsSeriesSet(sLbls []labels.Labels) *NoChunksConcreteLabelsSeriesSet {
+	return newNoChunksConcreteLabelsSeriesSet(context.Background(), sLbls, NoopMaterializedSeriesFunc)
+}
+
+func newNoChunksConcreteLabelsSeriesSet(ctx context.Context, sLbls []labels.Labels, callback MaterializedSeriesFunc) *NoChunksConcreteLabelsSeriesSet {
 	seriesSet := make([]*ConcreteChunksSeries, len(sLbls))
 	for i, lbls := range sLbls {
 		seriesSet[i] = &ConcreteChunksSeries{lbls: lbls}
 	}
 	return &NoChunksConcreteLabelsSeriesSet{
+		ctx:              ctx,
 		seriesSet:        seriesSet,
 		currentSeriesIdx: -1,
+		callback:         callback,
 	}
 }
 
@@ -82,11 +91,12 @@ func (s *NoChunksConcreteLabelsSeriesSet) Next() bool {
 		return false
 	}
 	s.currentSeriesIdx++
-	return true
+	s.err = s.callback(s.ctx, s.At())
+	return s.err == nil
 }
 
 func (s *NoChunksConcreteLabelsSeriesSet) Err() error {
-	return nil
+	return s.err
 }
 
 func (s *NoChunksConcreteLabelsSeriesSet) Warnings() annotations.Annotations {
