@@ -640,6 +640,46 @@ func TestConstraintCacheKeyShardCollision(t *testing.T) {
 	require.Empty(t, rr2)
 }
 
+type countingConstraint struct {
+	Constraint
+	prefilterCalls int
+	filterCalls    int
+}
+
+func (c *countingConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, error) {
+	c.prefilterCalls++
+	return c.Constraint.prefilter(rgIdx, rr)
+}
+
+func (c *countingConstraint) filter(ctx context.Context, rgIdx int, primary bool, rr []RowRange) ([]RowRange, error) {
+	c.filterCalls++
+	return c.Constraint.filter(ctx, rgIdx, primary, rr)
+}
+
+func TestFilterCachesEmptyResult(t *testing.T) {
+	type s struct {
+		A string `parquet:",optional,dict"`
+	}
+
+	shard := buildFile(t, []s{{A: "present"}})
+	constraint := &countingConstraint{Constraint: Equal("A", parquet.ValueOf("missing"))}
+	require.NoError(t, Initialize(shard.LabelsFile(), constraint))
+
+	cache := NewConstraintRowRangeCacheSyncMap()
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+
+	result, err := Filter(context.Background(), shard, 0, cache, constraint)
+	require.NoError(t, err)
+	require.Empty(t, result)
+	require.Equal(t, 1, constraint.prefilterCalls)
+
+	result, err = Filter(context.Background(), shard, 0, cache, constraint)
+	require.NoError(t, err)
+	require.Empty(t, result)
+	require.Equal(t, 1, constraint.prefilterCalls, "empty cache hit must skip matcher reads")
+	require.Zero(t, constraint.filterCalls)
+}
+
 func TestSortConstraintsBySortingColumns(t *testing.T) {
 	tests := []struct {
 		name           string
