@@ -194,7 +194,10 @@ func Filter(ctx context.Context, f storage.ParquetShard, rgIdx int, cache RowRan
 	res := slices.Clone(rr)
 
 	if len(res) == 0 {
-		return nil, nil
+		if cache != nil {
+			_ = cache.Set(ctx, f, rgIdx, cs, res)
+		}
+		return res, nil
 	}
 
 	// Second pass page filter find the real set of matching rows, done concurrently because it involves IO

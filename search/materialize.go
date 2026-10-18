@@ -15,6 +15,7 @@ package search
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"iter"
 	"maps"
@@ -414,8 +415,9 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 	}
 
 	var (
-		colsMap   = make(map[int][]RowRange, 10)
-		needsHash bool
+		colsMap                  = make(map[int][]RowRange, 10)
+		needsRawSeriesHash       bool
+		needsProjectedSeriesHash bool
 	)
 
 	labelsSchema := m.b.LabelsFile().Schema()
@@ -431,13 +433,12 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		span.SetAttributes(attribute.StringSlice("projection_labels", hints.ProjectionLabels))
 
 		for _, labelName := range hints.ProjectionLabels {
-			if labelName == schema.SeriesHashColumn {
-				needsHash = true
-				col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
-				if ok {
-					colsMap[col.ColumnIndex] = []RowRange{}
-				}
-			} else {
+			switch labelName {
+			case schema.SeriesHashColumn:
+				needsRawSeriesHash = true
+			case schema.ProjectedSeriesHashLabel:
+				needsProjectedSeriesHash = true
+			default:
 				col, ok := labelsSchema.Lookup(schema.LabelToColumn(labelName))
 				if !ok {
 					continue
@@ -468,15 +469,10 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 			}
 		}
 		// Hash column is only needed if projection labels are provided and series hash is not excluded.
-		needsHash = !seriesHashExcluded && len(hints.ProjectionLabels) > 0
+		needsRawSeriesHash = !seriesHashExcluded && len(hints.ProjectionLabels) > 0
 
 		for _, labelName := range hints.ProjectionLabels {
-			if labelName == schema.SeriesHashColumn {
-				col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
-				if ok {
-					delete(colsMap, col.ColumnIndex)
-				}
-			} else {
+			if labelName != schema.SeriesHashColumn {
 				col, ok := labelsSchema.Lookup(schema.LabelToColumn(labelName))
 				if !ok {
 					continue
@@ -574,11 +570,11 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 	}
 
 	var hashes []parquet.Value
-	if needsHash {
+	if needsRawSeriesHash || needsProjectedSeriesHash {
 		errGroup.Go(func() error {
-			col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
-			if !ok {
-				return fmt.Errorf("unable to find series hash column %q", schema.SeriesHashColumn)
+			col, err := seriesHashColumn(labelsSchema)
+			if err != nil {
+				return err
 			}
 			columnChunk := labelsRowGroup.ColumnChunks()[col.ColumnIndex]
 
@@ -595,12 +591,22 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		return nil, err
 	}
 
-	if needsHash {
+	if needsRawSeriesHash || needsProjectedSeriesHash {
 		for i := range hashes {
-			if !hashes[i].IsNull() {
+			if needsRawSeriesHash && !hashes[i].IsNull() {
 				results[i] = append(results[i], labels.Label{
 					Name:  schema.SeriesHashColumn,
 					Value: util.YoloString(hashes[i].ByteArray()),
+				})
+			}
+			if needsProjectedSeriesHash {
+				value, err := projectedSeriesHashValue(hashes[i])
+				if err != nil {
+					return nil, fmt.Errorf("invalid projected series hash for row %d: %w", i, err)
+				}
+				results[i] = append(results[i], labels.Label{
+					Name:  schema.ProjectedSeriesHashLabel,
+					Value: value,
 				})
 			}
 		}
@@ -611,6 +617,27 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		attribute.Int("columns_materialized", len(colsMap)),
 	)
 	return results, nil
+}
+
+func projectedSeriesHashValue(value parquet.Value) (string, error) {
+	if value.IsNull() {
+		return "", errors.New("series hash is null")
+	}
+
+	hash := value.ByteArray()
+	if len(hash) != 8 {
+		return "", fmt.Errorf("series hash has length %d, want 8", len(hash))
+	}
+
+	return hex.EncodeToString(hash), nil
+}
+
+func seriesHashColumn(labelsSchema *parquet.Schema) (parquet.LeafColumn, error) {
+	col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
+	if !ok {
+		return parquet.LeafColumn{}, fmt.Errorf("unable to find series hash column %q", schema.SeriesHashColumn)
+	}
+	return col, nil
 }
 
 // getColumnIndexes retrieves the column index data for all rows in the specified ranges

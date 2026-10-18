@@ -29,6 +29,10 @@ const (
 	DataColumnPrefix  = "s_data_"
 	ColIndexesColumn  = "s_col_indexes"
 	SeriesHashColumn  = "s_series_hash"
+	// ProjectedSeriesHashLabel is the virtual label exposed when callers request
+	// a stable series identity through projection hints. Its value is the
+	// hexadecimal representation of SeriesHashColumn.
+	ProjectedSeriesHashLabel = "__series_hash__"
 
 	DataColSizeMd = "data_col_duration_ms"
 	MinTMd        = "minT"

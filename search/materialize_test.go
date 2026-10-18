@@ -15,6 +15,7 @@ package search
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -548,13 +549,13 @@ func TestProjectionHints(t *testing.T) {
 	s, err := shard.TSDBSchema()
 	require.NoError(t, err)
 
-	t.Run("ProjectionIncludeWithHash", func(t *testing.T) {
-		// Test projection with include including s_series_hash
+	t.Run("ProjectionIncludeWithRawAndProjectedHash", func(t *testing.T) {
+		// Test projection with both the stored hash and canonical projected identity.
 		m, err := NewMaterializer(s, schema.NewPrometheusParquetChunksDecoder(chunkenc.NewPool()), shard, 10, UnlimitedQuota(), UnlimitedQuota(), UnlimitedQuota(), NoopMaterializedSeriesFunc, NoopMaterializedLabelsFilterCallback, true)
 		require.NoError(t, err)
 
 		hints := &prom_storage.SelectHints{
-			ProjectionLabels:  []string{"__name__", "unique", "s_series_hash"},
+			ProjectionLabels:  []string{"__name__", "unique", schema.SeriesHashColumn, schema.ProjectedSeriesHashLabel},
 			ProjectionInclude: true,
 		}
 
@@ -564,15 +565,50 @@ func TestProjectionHints(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, result)
 
-		// Verify that only projected labels are present
+		// Verify that only projected labels are present and each hash is read once.
 		for _, seriesLabels := range result {
+			rawHashes := 0
+			projectedHashes := 0
+			var rawHash, projectedHash string
 			for _, lbl := range seriesLabels {
-				// Should only contain __name__, unique, or s_series_hash
 				require.True(t,
-					lbl.Name == "__name__" || lbl.Name == "unique" || lbl.Name == "s_series_hash",
+					lbl.Name == "__name__" || lbl.Name == "unique" || lbl.Name == schema.SeriesHashColumn || lbl.Name == schema.ProjectedSeriesHashLabel,
 					"Unexpected label %s found in projected result", lbl.Name)
+				if lbl.Name == schema.SeriesHashColumn {
+					rawHashes++
+					rawHash = lbl.Value
+				}
+				if lbl.Name == schema.ProjectedSeriesHashLabel {
+					projectedHashes++
+					projectedHash = lbl.Value
+				}
 			}
+			require.Equal(t, 1, rawHashes)
+			require.Equal(t, 1, projectedHashes)
+			require.Equal(t, hex.EncodeToString([]byte(rawHash)), projectedHash)
 		}
+	})
+
+	// Projected identity keeps series with identical retained labels distinct.
+	t.Run("ProjectedHashKeepsSeriesDistinct", func(t *testing.T) {
+		m, err := NewMaterializer(s, schema.NewPrometheusParquetChunksDecoder(chunkenc.NewPool()), shard, 10, UnlimitedQuota(), UnlimitedQuota(), UnlimitedQuota(), NoopMaterializedSeriesFunc, NoopMaterializedLabelsFilterCallback, true)
+		require.NoError(t, err)
+
+		result, err := m.MaterializeLabels(ctx, &prom_storage.SelectHints{
+			ProjectionLabels:  []string{"__name__", schema.ProjectedSeriesHashLabel},
+			ProjectionInclude: true,
+		}, 0, []RowRange{{From: 0, Count: 10}})
+		require.NoError(t, err)
+
+		identities := make(map[string]struct{}, len(result))
+		for _, seriesLabels := range result {
+			lbls := labels.New(seriesLabels...)
+			require.NotEmpty(t, lbls.Get(labels.MetricName))
+			identity := lbls.Get(schema.ProjectedSeriesHashLabel)
+			require.Len(t, identity, 16)
+			identities[identity] = struct{}{}
+		}
+		require.Len(t, identities, len(result))
 	})
 
 	t.Run("ProjectionIncludeWithoutHash", func(t *testing.T) {
@@ -719,4 +755,19 @@ func TestProjectionHints(t *testing.T) {
 				"Should have same number of labels when projection hints are disabled")
 		}
 	})
+}
+
+func TestProjectedSeriesHashValue(t *testing.T) {
+	valid, err := projectedSeriesHashValue(parquet.ValueOf([]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0xfe, 0xff}))
+	require.NoError(t, err)
+	require.Equal(t, "000102030405feff", valid)
+
+	_, err = projectedSeriesHashValue(parquet.NullValue())
+	require.EqualError(t, err, "series hash is null")
+
+	_, err = projectedSeriesHashValue(parquet.ValueOf([]byte{0x01, 0x02}))
+	require.EqualError(t, err, "series hash has length 2, want 8")
+
+	_, err = seriesHashColumn(parquet.NewSchema("labels", parquet.Group{}))
+	require.EqualError(t, err, "unable to find series hash column \"s_series_hash\"")
 }
