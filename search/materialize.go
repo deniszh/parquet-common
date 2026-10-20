@@ -78,10 +78,17 @@ type MaterializedLabelsFilterCallback func(ctx context.Context, hints *prom_stor
 type MaterializedLabelsFilter interface {
 	// Filter returns true if the labels should be included in the result.
 	Filter(ls labels.Labels) bool
-	// Filters may additionally implement FilterHash(uint64) bool to apply the
-	// same predicate to the stored labels.StableHash before labels are decoded.
 	// Close is used to close the filter and do some cleanup.
 	Close()
+}
+
+// MaterializedSeriesHashFilter can filter series before their labels are decoded.
+// FilterHash(labels.StableHash(ls)) must return the same result as Filter(ls),
+// using the full series identity, independently of label projection hints.
+type MaterializedSeriesHashFilter interface {
+	MaterializedLabelsFilter
+	// FilterHash replaces Filter when the file declares a compatible hash encoding.
+	FilterHash(uint64) bool
 }
 
 // NoopMaterializedLabelsFilterCallback is a noop MaterializedLabelsFilterCallback function that filters nothing.
@@ -158,27 +165,40 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		return nil, err
 	}
 	labelsFilter, enabled := m.materializedLabelsFilterCallback(ctx, hints)
+	var hashes []parquet.Value
+	projectAfterFiltering := false
 	if enabled {
 		defer labelsFilter.Close()
-		if hashFilter, ok := labelsFilter.(interface{ FilterHash(uint64) bool }); ok {
+		if hashFilter, ok := labelsFilter.(MaterializedSeriesHashFilter); ok {
 			var filtered bool
-			rr, filtered, err = m.filterBySeriesHash(ctx, rgi, rr, hashFilter.FilterHash)
+			rr, hashes, filtered, err = m.filterBySeriesHash(ctx, rgi, rr, hashFilter.FilterHash)
 			if err != nil {
 				return nil, errors.Wrap(err, "error filtering series hashes")
 			}
 			if filtered {
 				labelsFilter = nil
+			} else {
+				// An untrusted hash must not change shard ownership when labels
+				// are projected. Filter the full identity before projecting it.
+				projectAfterFiltering = m.honorProjectionHints && hints != nil
 			}
 		}
 	} else {
 		labelsFilter = nil
 	}
-	sLbls, err := m.MaterializeLabels(ctx, hints, rgi, rr)
+	labelHints := hints
+	if projectAfterFiltering {
+		labelHints = nil
+	}
+	sLbls, err := m.materializeLabels(ctx, labelHints, rgi, rr, hashes)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error materializing labels")
 	}
 
 	seriesSetLabels, rr := filterSeriesLabels(sLbls, rr, labelsFilter)
+	if projectAfterFiltering {
+		seriesSetLabels = projectSeriesLabels(seriesSetLabels, hints)
+	}
 
 	if skipChunks {
 		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
@@ -195,36 +215,64 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 	return seriesSetIter, nil
 }
 
-// filterBySeriesHash leaves cached constraint ranges untouched. Older files
-// without a stored hash retain the label-based filtering path.
-func (m *Materializer) filterBySeriesHash(ctx context.Context, rgi int, rr []RowRange, keep func(uint64) bool) ([]RowRange, bool, error) {
+func projectSeriesLabels(series []labels.Labels, hints *prom_storage.SelectHints) []labels.Labels {
+	includeHash := slices.Contains(hints.ProjectionLabels, schema.SeriesHashColumn)
+	if !hints.ProjectionInclude {
+		includeHash = !includeHash && len(hints.ProjectionLabels) > 0
+	}
+	for i, ls := range series {
+		builder := labels.NewBuilder(ls)
+		if includeHash {
+			var hash [8]byte
+			binary.BigEndian.PutUint64(hash[:], labels.StableHash(ls))
+			builder.Set(schema.SeriesHashColumn, string(hash[:]))
+		}
+		if hints.ProjectionInclude {
+			builder.Keep(hints.ProjectionLabels...)
+		} else {
+			builder.Del(hints.ProjectionLabels...)
+		}
+		series[i] = builder.Labels()
+	}
+	return series
+}
+
+// filterBySeriesHash leaves cached constraint ranges untouched. Unversioned,
+// unknown, or invalid hashes retain the label-based filtering path.
+func (m *Materializer) filterBySeriesHash(ctx context.Context, rgi int, rr []RowRange, keep func(uint64) bool) ([]RowRange, []parquet.Value, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, false, err
+		return nil, nil, false, err
+	}
+	encoding, ok := m.b.LabelsFile().Lookup(schema.SeriesHashEncodingMd)
+	if !ok || encoding != schema.SeriesHashStableV1 {
+		return rr, nil, false, nil
 	}
 	col, ok := m.b.LabelsFile().Schema().Lookup(schema.SeriesHashColumn)
 	if !ok {
-		return rr, false, nil
+		return rr, nil, false, nil
 	}
 	cc := m.b.LabelsFile().RowGroups()[rgi].ColumnChunks()[col.ColumnIndex]
 	values, err := m.materializeColumnSlice(ctx, m.b.LabelsFile(), rgi, rr, cc, false)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	if int64(len(values)) != totalRows(rr) {
-		return nil, false, fmt.Errorf("series hash count %d does not match row count %d", len(values), totalRows(rr))
+		return rr, nil, false, nil
 	}
 	filtered := make([]RowRange, 0, len(rr))
+	hashes := values[:0]
 	idx := 0
 	for _, r := range rr {
 		for row := r.From; row < r.From+r.Count; row++ {
 			v := values[idx]
 			idx++
-			if v.IsNull() || len(v.ByteArray()) != 8 {
-				return nil, false, fmt.Errorf("invalid series hash at row %d: expected 8 bytes", row)
+			if v.IsNull() || (v.Kind() != parquet.ByteArray && v.Kind() != parquet.FixedLenByteArray) || len(v.ByteArray()) != 8 {
+				return rr, nil, false, nil
 			}
 			if !keep(binary.BigEndian.Uint64(v.ByteArray())) {
 				continue
 			}
+			hashes = append(hashes, v)
 			if n := len(filtered); n > 0 && filtered[n-1].From+filtered[n-1].Count == row {
 				filtered[n-1].Count++
 			} else {
@@ -232,7 +280,7 @@ func (m *Materializer) filterBySeriesHash(ctx context.Context, rgi int, rr []Row
 			}
 		}
 	}
-	return filtered, true, nil
+	return filtered, hashes, true, nil
 }
 
 func (m *Materializer) FilterSeriesLabels(ctx context.Context, hints *prom_storage.SelectHints, sLbls [][]labels.Label, rr []RowRange) ([]labels.Labels, []RowRange) {
@@ -449,6 +497,10 @@ func (m *Materializer) MaterializeAllLabelValues(ctx context.Context, name strin
 // Returns all labels when projection is disabled, or only requested labels in the hints when enabled.
 // The s_series_hash column is included only when explicitly requested.
 func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storage.SelectHints, rgi int, rr []RowRange) ([][]labels.Label, error) {
+	return m.materializeLabels(ctx, hints, rgi, rr, nil)
+}
+
+func (m *Materializer) materializeLabels(ctx context.Context, hints *prom_storage.SelectHints, rgi int, rr []RowRange, hashes []parquet.Value) ([][]labels.Label, error) {
 	ctx, span := tracer.Start(ctx, "Materializer.MaterializeLabels")
 	var err error
 	defer func() {
@@ -499,10 +551,6 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		for _, labelName := range hints.ProjectionLabels {
 			if labelName == schema.SeriesHashColumn {
 				needsHash = true
-				col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
-				if ok {
-					colsMap[col.ColumnIndex] = []RowRange{}
-				}
 			} else {
 				col, ok := labelsSchema.Lookup(schema.LabelToColumn(labelName))
 				if !ok {
@@ -557,6 +605,12 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		for columnId, rowRanges := range columnToRowRanges {
 			colsMap[columnId] = rowRanges
 		}
+	}
+
+	// The hash column is handled separately and may already have been read by
+	// the shard prefilter. It is never an ordinary projected label column.
+	if col, ok := labelsSchema.Lookup(schema.SeriesHashColumn); ok {
+		delete(colsMap, col.ColumnIndex)
 	}
 
 	span.SetAttributes(attribute.Int("columns_to_materialize", len(colsMap)))
@@ -639,8 +693,7 @@ func (m *Materializer) MaterializeLabels(ctx context.Context, hints *prom_storag
 		})
 	}
 
-	var hashes []parquet.Value
-	if needsHash {
+	if needsHash && hashes == nil {
 		errGroup.Go(func() error {
 			col, ok := labelsSchema.Lookup(schema.SeriesHashColumn)
 			if !ok {
@@ -789,7 +842,7 @@ func (m *Materializer) materializeColumnIter(
 	cc parquet.ColumnChunk,
 	chunkColumn bool,
 ) (*ColumnValueIterator, error) {
-	pageRanges, err := m.getPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
+	pageRanges, err := m.GetPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
 	if err != nil {
 		return nil, err
 	}
@@ -837,7 +890,7 @@ func (m *Materializer) materializeColumnSlice(
 		attribute.Int("concurrency", m.concurrency),
 	)
 
-	pageRanges, err := m.getPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
+	pageRanges, err := m.GetPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
 	if err != nil || len(pageRanges) == 0 {
 		return nil, err
 	}
@@ -904,11 +957,18 @@ func (pr *PageToReadWithRow) Rows() []RowRange {
 	return pr.rows
 }
 
+// GetPageRangesForColummn is retained for source compatibility.
+//
+// Deprecated: use GetPageRangesForColumn with the query's context.
 func (m *Materializer) GetPageRangesForColummn(cc parquet.ColumnChunk, file storage.ParquetFileView, rgi int, rr []RowRange, chunkColumn bool) ([]PageToReadWithRow, error) {
-	return m.getPageRangesForColumn(context.Background(), cc, file, rgi, rr, chunkColumn)
+	return m.GetPageRangesForColumn(context.Background(), cc, file, rgi, rr, chunkColumn)
 }
 
-func (m *Materializer) getPageRangesForColumn(ctx context.Context, cc parquet.ColumnChunk, file storage.ParquetFileView, rgi int, rr []RowRange, chunkColumn bool) ([]PageToReadWithRow, error) {
+// GetPageRangesForColumn loads page indexes using the caller's context.
+func (m *Materializer) GetPageRangesForColumn(ctx context.Context, cc parquet.ColumnChunk, file storage.ParquetFileView, rgi int, rr []RowRange, chunkColumn bool) ([]PageToReadWithRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(rr) == 0 {
 		return nil, nil
 	}

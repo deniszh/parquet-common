@@ -25,6 +25,11 @@ import (
 
 func iteratorTestPage(t testing.TB, dictionary bool, count int, prefix string) parquet.Page {
 	t.Helper()
+	return iteratorTestPageWithCardinality(t, dictionary, count, count, prefix)
+}
+
+func iteratorTestPageWithCardinality(t testing.TB, dictionary bool, count, distinct int, prefix string) parquet.Page {
+	t.Helper()
 	var node parquet.Node = parquet.String()
 	if dictionary {
 		node = parquet.Encoded(node, &parquet.RLEDictionary)
@@ -37,7 +42,7 @@ func iteratorTestPage(t testing.TB, dictionary bool, count int, prefix string) p
 		if i%7 == 0 {
 			rows[i] = parquet.Row{parquet.NullValue().Level(0, 0, 0)}
 		} else {
-			rows[i] = parquet.Row{parquet.ValueOf(fmt.Sprintf("%s-%06d", prefix, i)).Level(0, 1, 0)}
+			rows[i] = parquet.Row{parquet.ValueOf(fmt.Sprintf("%s-%06d", prefix, i%distinct)).Level(0, 1, 0)}
 		}
 	}
 	_, err := w.WriteRows(rows)
@@ -105,7 +110,7 @@ func BenchmarkPageValueIteratorSparseDictionary(b *testing.B) {
 	b.ResetTimer()
 	var it PageValueIterator
 	for b.Loop() {
-		it.Reset(pg)
+		it.reset(pg, 1)
 		it.Skip(1)
 		if !it.Next() {
 			b.Fatal(it.Err())
@@ -114,17 +119,18 @@ func BenchmarkPageValueIteratorSparseDictionary(b *testing.B) {
 	}
 }
 
-func TestPageValueIteratorBoundsSymbolCache(t *testing.T) {
+func TestPageValueIteratorReleasesDenseCache(t *testing.T) {
 	var it PageValueIterator
 	pg := iteratorTestPage(t, true, 2048, "first")
 	it.Reset(pg)
 	for it.Next() {
 		_ = it.At()
 	}
-	require.Len(t, it.cachedSymbols, maxCachedPageSymbols)
+	require.Greater(t, len(it.cachedSymbols), maxRetainedPageSymbols)
 	it.err = io.ErrUnexpectedEOF
 	it.Reset(iteratorTestPage(t, true, 2, "second"))
 	require.Empty(t, it.cachedSymbols)
+	require.LessOrEqual(t, it.cacheCapacity, maxRetainedPageSymbols)
 	require.NoError(t, it.Err())
 	require.True(t, it.Next())
 	require.True(t, it.At().IsNull())
@@ -144,6 +150,64 @@ func BenchmarkPageValueIteratorDenseDictionary(b *testing.B) {
 		}
 		if err := it.Err(); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func TestPageValueIteratorReusesHighCardinalitySymbols(t *testing.T) {
+	pg := iteratorTestPageWithCardinality(t, true, 65536, 8192, "repeated")
+	var it PageValueIterator
+	it.Reset(pg)
+	first := map[string]*byte{}
+	for it.Next() {
+		value := it.At()
+		if value.IsNull() {
+			continue
+		}
+		bytes := value.ByteArray()
+		key := string(bytes)
+		if previous, ok := first[key]; ok {
+			require.Same(t, previous, &bytes[0], "symbol must not be cloned again")
+		} else {
+			first[key] = &bytes[0]
+		}
+	}
+	require.NoError(t, it.Err())
+	require.Greater(t, len(first), 1024)
+}
+
+func BenchmarkPageValueIteratorDictionaryDensity(b *testing.B) {
+	for _, tt := range []struct {
+		name                     string
+		rows, distinct, selected int
+	}{
+		{"sparse", 65536, 65536, 1},
+		{"dense_unique", 65536, 65536, 65536},
+		{"dense_repeated", 65536, 8192, 65536},
+	} {
+		pg := iteratorTestPageWithCardinality(b, true, tt.rows, tt.distinct, "symbol")
+		for _, sized := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%s/selected_rows=%v", tt.name, sized), func(b *testing.B) {
+				var it PageValueIterator
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					if sized {
+						it.reset(pg, tt.selected)
+					} else {
+						it.Reset(pg)
+					}
+					if tt.selected == 1 {
+						it.Skip(1)
+					}
+					for row := 0; row < tt.selected; row++ {
+						if !it.Next() {
+							b.Fatal(it.Err())
+						}
+						_ = it.At()
+					}
+				}
+			})
 		}
 	}
 }

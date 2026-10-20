@@ -20,6 +20,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/prometheus/prometheus/model/labels"
@@ -36,9 +37,23 @@ import (
 
 type contextCheckingBucket struct{ objstore.Bucket }
 
+type blockedIndexReadKey struct{}
+type blockedIndexRead struct {
+	offset  int64
+	started chan struct{}
+}
+
 func (b contextCheckingBucket) GetRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if blocked, ok := ctx.Value(blockedIndexReadKey{}).(*blockedIndexRead); ok && blocked.offset == off {
+		select {
+		case blocked.started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return b.Bucket.GetRange(ctx, name, off, length)
 }
@@ -106,6 +121,46 @@ func TestLazyPageIndexes(t *testing.T) {
 	cancel()
 	_, err = m.Materialize(cancelled, nil, 0, data.MinTime, data.MaxTime, true, []RowRange{{From: 0, Count: 64}})
 	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, query(t, data.MinTime, data.MaxTime, cold), len(expected), "cancelled index errors must not remain cached")
+
+	for _, index := range []string{"offset", "column"} {
+		t.Run("cancelled_first_"+index+"_index", func(t *testing.T) {
+			cold := open()
+			file := cold.LabelsFile()
+			col, ok := file.Schema().Lookup(schema.ColIndexesColumn)
+			require.True(t, ok)
+			metadata := file.Metadata().RowGroups[0].Columns[col.ColumnIndex]
+			offset := metadata.OffsetIndexOffset
+			if index == "column" {
+				offset = metadata.ColumnIndexOffset
+			}
+			require.Positive(t, offset)
+			blocked := &blockedIndexRead{offset: offset, started: make(chan struct{}, 1)}
+			queryCtx, cancel := context.WithCancel(context.WithValue(ctx, blockedIndexReadKey{}, blocked))
+			defer cancel()
+			m := &Materializer{dataBytesQuota: UnlimitedQuota(), partitioner: util.NewGapBasedPartitioner(0)}
+			cc := file.RowGroups()[0].ColumnChunks()[col.ColumnIndex]
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := m.GetPageRangesForColumn(queryCtx, cc, file, 0, []RowRange{{From: 0, Count: 64}}, false)
+				errCh <- err
+			}()
+			select {
+			case <-blocked.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("query did not reach the lazy index read")
+			}
+			require.Len(t, query(t, data.MinTime, data.MaxTime, cold), len(expected), "a blocked query must not prevent another query from loading the index")
+			cancel()
+			select {
+			case err := <-errCh:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancelled index read did not return")
+			}
+			require.Len(t, query(t, data.MinTime, data.MaxTime, cold), len(expected))
+		})
+	}
 }
 
 func BenchmarkOpenWidePageIndexes(b *testing.B) {

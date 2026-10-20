@@ -43,9 +43,10 @@ func NewBuilder(mint, maxt, colDuration int64) *Builder {
 		g:                 make(parquet.Group),
 		dataColDurationMs: colDuration,
 		metadata: map[string]string{
-			DataColSizeMd: strconv.FormatInt(colDuration, 10),
-			MaxTMd:        strconv.FormatInt(maxt, 10),
-			MinTMd:        strconv.FormatInt(mint, 10),
+			DataColSizeMd:        strconv.FormatInt(colDuration, 10),
+			MaxTMd:               strconv.FormatInt(maxt, 10),
+			MinTMd:               strconv.FormatInt(mint, 10),
+			SeriesHashEncodingMd: SeriesHashStableV1,
 		},
 		mint: mint,
 		maxt: maxt,

@@ -92,6 +92,13 @@ func main() {
 
 ### Querying Parquet Data
 
+Filters implementing `search.MaterializedSeriesHashFilter` can use stored series
+hashes before decoding labels. This requires file metadata
+`series_hash_encoding=prometheus-labels-stablehash-be-v1`, written by the converter.
+Files without this marker, with an unknown encoding, or with null or malformed
+hashes use label filtering. Older files remain readable, but need conversion with
+the new writer before they can use the hash prefilter.
+
 Query Parquet files using the Prometheus-compatible interface:
 
 ```go

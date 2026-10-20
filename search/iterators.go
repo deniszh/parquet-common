@@ -465,7 +465,15 @@ func (i *RowRangesValueIterator) Next() bool {
 			i.err = errors.Wrap(err, "failed to read page")
 			return false
 		}
-		i.pageIterator.Reset(page)
+		pageEnd := i.currentRow + page.NumRows()
+		rowsToRead := max(int64(0), min(i.next+i.remaining, pageEnd)-i.next)
+		for _, rr := range i.remainingRr {
+			if rr.From >= pageEnd {
+				break
+			}
+			rowsToRead += min(rr.From+rr.Count, pageEnd) - rr.From
+		}
+		i.pageIterator.reset(page, int(rowsToRead))
 		// Reset page values buffer
 		i.currentBufferIndex = 0
 		i.buffer = i.buffer[:0]
@@ -507,13 +515,14 @@ func (i *RowRangesValueIterator) Close() error {
 	return i.pgs.Close()
 }
 
-const maxCachedPageSymbols = 1024
+const maxRetainedPageSymbols = 1024
 
 // PageValueIterator yields individual parquet Values from its Page.
 type PageValueIterator struct {
 	p parquet.Page
 
 	cachedSymbols map[int32]parquet.Value
+	cacheCapacity int
 	st            SymbolTable
 
 	vr parquet.ValueReader
@@ -533,9 +542,7 @@ func (i *PageValueIterator) At() parquet.Value {
 			return v
 		}
 		v := i.st.Get(i.current).Clone()
-		if len(i.cachedSymbols) < maxCachedPageSymbols {
-			i.cachedSymbols[dicIndex] = v
-		}
+		i.cachedSymbols[dicIndex] = v
 		return v
 	}
 	return i.buffer[i.currentBufferIndex].Clone()
@@ -592,19 +599,26 @@ func (vi *PageValueIterator) Skip(n int64) int64 {
 }
 
 func (i *PageValueIterator) Reset(p parquet.Page) {
+	i.reset(p, int(p.NumRows()))
+}
+
+// reset sizes the cache to the selected rows, rather than the whole row-group
+// dictionary. Dense reads still clone each symbol only once per page.
+func (i *PageValueIterator) reset(p parquet.Page, rowsToRead int) {
 	i.p = p
 	i.vr = nil
 	if p.Dictionary() != nil {
 		i.st.Reset(p)
-		// Sparse reads often visit only a few entries of a large dictionary.
-		// Reuse the bounded cache across pages without sizing it to the dictionary.
-		if i.cachedSymbols == nil {
-			i.cachedSymbols = make(map[int32]parquet.Value)
+		capacity := min(rowsToRead, p.Dictionary().Len()+1)
+		if i.cachedSymbols == nil || i.cacheCapacity > maxRetainedPageSymbols || i.cacheCapacity < capacity {
+			i.cachedSymbols = make(map[int32]parquet.Value, capacity)
+			i.cacheCapacity = capacity
 		} else {
 			clear(i.cachedSymbols)
 		}
 	} else {
 		i.cachedSymbols = nil
+		i.cacheCapacity = 0
 		i.st.dict = nil
 		i.st.defs = nil
 		i.vr = p.Values()

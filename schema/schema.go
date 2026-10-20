@@ -29,6 +29,9 @@ const (
 	DataColumnPrefix  = "s_data_"
 	ColIndexesColumn  = "s_col_indexes"
 	SeriesHashColumn  = "s_series_hash"
+	// SeriesHashEncodingMd declares the algorithm and byte order of SeriesHashColumn.
+	SeriesHashEncodingMd = "series_hash_encoding"
+	SeriesHashStableV1   = "prometheus-labels-stablehash-be-v1"
 
 	DataColSizeMd = "data_col_duration_ms"
 	MinTMd        = "minT"
