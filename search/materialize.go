@@ -702,7 +702,7 @@ func (m *Materializer) buildColumnMappings(rr []RowRange, columnIndexes []parque
 
 	for _, rowRange := range rr {
 		rowRangeToStartIndex[rowRange] = resultIndex
-		seenColumns := util.NewBitmap(len(m.b.LabelsFile().ColumnIndexes()))
+		seenColumns := util.NewBitmap(len(m.b.LabelsFile().Schema().Columns()))
 
 		// Process each row in the current range
 		for rowInRange := int64(0); rowInRange < rowRange.Count; rowInRange++ {
@@ -789,7 +789,7 @@ func (m *Materializer) materializeColumnIter(
 	cc parquet.ColumnChunk,
 	chunkColumn bool,
 ) (*ColumnValueIterator, error) {
-	pageRanges, err := m.GetPageRangesForColummn(cc, file, rgi, rr, chunkColumn)
+	pageRanges, err := m.getPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
 	if err != nil {
 		return nil, err
 	}
@@ -837,7 +837,7 @@ func (m *Materializer) materializeColumnSlice(
 		attribute.Int("concurrency", m.concurrency),
 	)
 
-	pageRanges, err := m.GetPageRangesForColummn(cc, file, rgi, rr, chunkColumn)
+	pageRanges, err := m.getPageRangesForColumn(ctx, cc, file, rgi, rr, chunkColumn)
 	if err != nil || len(pageRanges) == 0 {
 		return nil, err
 	}
@@ -905,16 +905,20 @@ func (pr *PageToReadWithRow) Rows() []RowRange {
 }
 
 func (m *Materializer) GetPageRangesForColummn(cc parquet.ColumnChunk, file storage.ParquetFileView, rgi int, rr []RowRange, chunkColumn bool) ([]PageToReadWithRow, error) {
+	return m.getPageRangesForColumn(context.Background(), cc, file, rgi, rr, chunkColumn)
+}
+
+func (m *Materializer) getPageRangesForColumn(ctx context.Context, cc parquet.ColumnChunk, file storage.ParquetFileView, rgi int, rr []RowRange, chunkColumn bool) ([]PageToReadWithRow, error) {
 	if len(rr) == 0 {
 		return nil, nil
 	}
 
-	oidx, err := cc.OffsetIndex()
+	oidx, err := offsetIndex(ctx, file, cc)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get offset index")
 	}
 
-	cidx, err := cc.ColumnIndex()
+	cidx, err := columnIndex(ctx, file, cc)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get column index")
 	}

@@ -589,7 +589,7 @@ func (m *mockConstraint) filter(ctx context.Context, rgIdx int, primary bool, rr
 	return rr, nil
 }
 
-func (m *mockConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, error) {
+func (m *mockConstraint) prefilter(ctx context.Context, rgIdx int, rr []RowRange) ([]RowRange, error) {
 	return rr, nil
 }
 
@@ -646,9 +646,9 @@ type countingConstraint struct {
 	filterCalls    int
 }
 
-func (c *countingConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, error) {
+func (c *countingConstraint) prefilter(ctx context.Context, rgIdx int, rr []RowRange) ([]RowRange, error) {
 	c.prefilterCalls++
-	return c.Constraint.prefilter(rgIdx, rr)
+	return c.Constraint.prefilter(ctx, rgIdx, rr)
 }
 
 func (c *countingConstraint) filter(ctx context.Context, rgIdx int, primary bool, rr []RowRange) ([]RowRange, error) {

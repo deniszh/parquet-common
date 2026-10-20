@@ -41,7 +41,7 @@ type Constraint interface {
 
 	// prefilter returns a set of non-overlapping increasing row indexes that may satisfy the constraint.
 	// This MUST be a superset of the real set of matching rows.
-	prefilter(rgIdx int, rr []RowRange) ([]RowRange, error)
+	prefilter(ctx context.Context, rgIdx int, rr []RowRange) ([]RowRange, error)
 
 	// filter returns a set of non-overlapping increasing row indexes that do satisfy the constraint.
 	// This MUST be the precise set of matching rows.
@@ -186,7 +186,7 @@ func Filter(ctx context.Context, f storage.ParquetShard, rgIdx int, cache RowRan
 	// First pass prefilter with a quick index scan to find a superset of matching rows
 	rr := []RowRange{{From: int64(0), Count: rg.NumRows()}}
 	for i := range cs {
-		rr, err = cs[i].prefilter(rgIdx, rr)
+		rr, err = cs[i].prefilter(ctx, rgIdx, rr)
 		if err != nil {
 			return nil, fmt.Errorf("unable to prefilter with constraint %d: %w", i, err)
 		}
@@ -360,7 +360,7 @@ func (ec *equalConstraint) String() string {
 	return fmt.Sprintf("equal(%q,%q)", ec.pth, ec.val)
 }
 
-func (ec *equalConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, error) {
+func (ec *equalConstraint) prefilter(ctx context.Context, rgIdx int, rr []RowRange) ([]RowRange, error) {
 	if len(rr) == 0 {
 		return nil, nil
 	}
@@ -385,11 +385,11 @@ func (ec *equalConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, erro
 		return nil, nil
 	}
 
-	oidx, err := cc.OffsetIndex()
+	oidx, err := offsetIndex(ctx, ec.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read offset index: %w", err)
 	}
-	cidx, err := cc.ColumnIndex()
+	cidx, err := columnIndex(ctx, ec.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read column index: %w", err)
 	}
@@ -465,11 +465,11 @@ func (ec *equalConstraint) filter(ctx context.Context, rgIdx int, primary bool, 
 		return nil, nil
 	}
 
-	oidx, err := cc.OffsetIndex()
+	oidx, err := offsetIndex(ctx, ec.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read offset index: %w", err)
 	}
-	cidx, err := cc.ColumnIndex()
+	cidx, err := columnIndex(ctx, ec.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read column index: %w", err)
 	}
@@ -670,7 +670,7 @@ func (rc *regexConstraint) String() string {
 	return fmt.Sprintf("regex(%v,%v)", rc.pth, rc.r.GetRegexString())
 }
 
-func (rc *regexConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, error) {
+func (rc *regexConstraint) prefilter(ctx context.Context, rgIdx int, rr []RowRange) ([]RowRange, error) {
 	if len(rr) == 0 {
 		return nil, nil
 	}
@@ -689,11 +689,11 @@ func (rc *regexConstraint) prefilter(rgIdx int, rr []RowRange) ([]RowRange, erro
 	}
 	cc := rg.ColumnChunks()[col.ColumnIndex].(*parquet.FileColumnChunk)
 
-	oidx, err := cc.OffsetIndex()
+	oidx, err := offsetIndex(ctx, rc.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read offset index: %w", err)
 	}
-	cidx, err := cc.ColumnIndex()
+	cidx, err := columnIndex(ctx, rc.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read column index: %w", err)
 	}
@@ -763,11 +763,11 @@ func (rc *regexConstraint) filter(ctx context.Context, rgIdx int, isPrimary bool
 	}
 	cc := rg.ColumnChunks()[col.ColumnIndex].(*parquet.FileColumnChunk)
 
-	oidx, err := cc.OffsetIndex()
+	oidx, err := offsetIndex(ctx, rc.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read offset index: %w", err)
 	}
-	cidx, err := cc.ColumnIndex()
+	cidx, err := columnIndex(ctx, rc.f, cc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read column index: %w", err)
 	}
@@ -946,7 +946,7 @@ func (nc *notConstraint) String() string {
 	return fmt.Sprintf("not(%v)", nc.c.String())
 }
 
-func (nc *notConstraint) prefilter(_ int, rr []RowRange) ([]RowRange, error) {
+func (nc *notConstraint) prefilter(_ context.Context, _ int, rr []RowRange) ([]RowRange, error) {
 	// NOT constraints cannot be prefiltered since the child constraint returns a superset of the matching row range,
 	// if we were to complement this row range the result here would be a subset and this would violate our interface.
 	return slices.Clone(rr), nil
