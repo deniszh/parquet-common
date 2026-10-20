@@ -15,6 +15,7 @@ package search
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"iter"
 	"maps"
@@ -77,6 +78,8 @@ type MaterializedLabelsFilterCallback func(ctx context.Context, hints *prom_stor
 type MaterializedLabelsFilter interface {
 	// Filter returns true if the labels should be included in the result.
 	Filter(ls labels.Labels) bool
+	// Filters may additionally implement FilterHash(uint64) bool to apply the
+	// same predicate to the stored labels.StableHash before labels are decoded.
 	// Close is used to close the filter and do some cleanup.
 	Close()
 }
@@ -154,12 +157,28 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		span.SetAttributes(attribute.String("quota_failure", "row_count"))
 		return nil, err
 	}
+	labelsFilter, enabled := m.materializedLabelsFilterCallback(ctx, hints)
+	if enabled {
+		defer labelsFilter.Close()
+		if hashFilter, ok := labelsFilter.(interface{ FilterHash(uint64) bool }); ok {
+			var filtered bool
+			rr, filtered, err = m.filterBySeriesHash(ctx, rgi, rr, hashFilter.FilterHash)
+			if err != nil {
+				return nil, errors.Wrap(err, "error filtering series hashes")
+			}
+			if filtered {
+				labelsFilter = nil
+			}
+		}
+	} else {
+		labelsFilter = nil
+	}
 	sLbls, err := m.MaterializeLabels(ctx, hints, rgi, rr)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error materializing labels")
 	}
 
-	seriesSetLabels, rr := m.FilterSeriesLabels(ctx, hints, sLbls, rr)
+	seriesSetLabels, rr := filterSeriesLabels(sLbls, rr, labelsFilter)
 
 	if skipChunks {
 		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
@@ -176,17 +195,64 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 	return seriesSetIter, nil
 }
 
-func (m *Materializer) FilterSeriesLabels(ctx context.Context, hints *prom_storage.SelectHints, sLbls [][]labels.Label, rr []RowRange) ([]labels.Labels, []RowRange) {
-	seriesLabels := make([]labels.Labels, 0, len(sLbls))
-	labelsFilter, ok := m.materializedLabelsFilterCallback(ctx, hints)
+// filterBySeriesHash leaves cached constraint ranges untouched. Older files
+// without a stored hash retain the label-based filtering path.
+func (m *Materializer) filterBySeriesHash(ctx context.Context, rgi int, rr []RowRange, keep func(uint64) bool) ([]RowRange, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	col, ok := m.b.LabelsFile().Schema().Lookup(schema.SeriesHashColumn)
 	if !ok {
+		return rr, false, nil
+	}
+	cc := m.b.LabelsFile().RowGroups()[rgi].ColumnChunks()[col.ColumnIndex]
+	values, err := m.materializeColumnSlice(ctx, m.b.LabelsFile(), rgi, rr, cc, false)
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(values)) != totalRows(rr) {
+		return nil, false, fmt.Errorf("series hash count %d does not match row count %d", len(values), totalRows(rr))
+	}
+	filtered := make([]RowRange, 0, len(rr))
+	idx := 0
+	for _, r := range rr {
+		for row := r.From; row < r.From+r.Count; row++ {
+			v := values[idx]
+			idx++
+			if v.IsNull() || len(v.ByteArray()) != 8 {
+				return nil, false, fmt.Errorf("invalid series hash at row %d: expected 8 bytes", row)
+			}
+			if !keep(binary.BigEndian.Uint64(v.ByteArray())) {
+				continue
+			}
+			if n := len(filtered); n > 0 && filtered[n-1].From+filtered[n-1].Count == row {
+				filtered[n-1].Count++
+			} else {
+				filtered = append(filtered, RowRange{From: row, Count: 1})
+			}
+		}
+	}
+	return filtered, true, nil
+}
+
+func (m *Materializer) FilterSeriesLabels(ctx context.Context, hints *prom_storage.SelectHints, sLbls [][]labels.Label, rr []RowRange) ([]labels.Labels, []RowRange) {
+	labelsFilter, enabled := m.materializedLabelsFilterCallback(ctx, hints)
+	if enabled {
+		defer labelsFilter.Close()
+	} else {
+		labelsFilter = nil
+	}
+	return filterSeriesLabels(sLbls, rr, labelsFilter)
+}
+
+func filterSeriesLabels(sLbls [][]labels.Label, rr []RowRange, labelsFilter MaterializedLabelsFilter) ([]labels.Labels, []RowRange) {
+	seriesLabels := make([]labels.Labels, 0, len(sLbls))
+	if labelsFilter == nil {
 		for _, s := range sLbls {
 			seriesLabels = append(seriesLabels, labels.New(s...))
 		}
 		return seriesLabels, rr
 	}
-
-	defer labelsFilter.Close()
 
 	filteredRR := make([]RowRange, 0, len(rr))
 	var currentRange RowRange
