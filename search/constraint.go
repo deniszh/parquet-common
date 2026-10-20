@@ -303,7 +303,7 @@ func (s *SymbolTable) Reset(pg parquet.Page) {
 	if s.syms == nil {
 		s.syms = make([]int32, len(s.defs))
 	} else {
-		s.syms = slices.Grow(s.syms, len(s.defs))[:len(s.defs)]
+		s.syms = slices.Grow(s.syms[:0], len(s.defs))[:len(s.defs)]
 	}
 
 	sidx := 0
@@ -325,7 +325,7 @@ func (s *SymbolTable) ResetWithRange(pg parquet.Page, l, r int) {
 	if s.syms == nil {
 		s.syms = make([]int32, len(s.defs))
 	} else {
-		s.syms = slices.Grow(s.syms, len(s.defs))[:len(s.defs)]
+		s.syms = slices.Grow(s.syms[:0], len(s.defs))[:len(s.defs)]
 	}
 
 	sidx := 0

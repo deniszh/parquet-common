@@ -507,6 +507,8 @@ func (i *RowRangesValueIterator) Close() error {
 	return i.pgs.Close()
 }
 
+const maxCachedPageSymbols = 1024
+
 // PageValueIterator yields individual parquet Values from its Page.
 type PageValueIterator struct {
 	p parquet.Page
@@ -527,10 +529,14 @@ func (i *PageValueIterator) At() parquet.Value {
 		dicIndex := i.st.GetIndex(i.current)
 		// Cache a clone of the current symbol table entry.
 		// This allows us to release the original page while avoiding unnecessary future clones.
-		if _, ok := i.cachedSymbols[dicIndex]; !ok {
-			i.cachedSymbols[dicIndex] = i.st.Get(i.current).Clone()
+		if v, ok := i.cachedSymbols[dicIndex]; ok {
+			return v
 		}
-		return i.cachedSymbols[dicIndex]
+		v := i.st.Get(i.current).Clone()
+		if len(i.cachedSymbols) < maxCachedPageSymbols {
+			i.cachedSymbols[dicIndex] = v
+		}
+		return v
 	}
 	return i.buffer[i.currentBufferIndex].Clone()
 }
@@ -590,8 +596,17 @@ func (i *PageValueIterator) Reset(p parquet.Page) {
 	i.vr = nil
 	if p.Dictionary() != nil {
 		i.st.Reset(p)
-		i.cachedSymbols = make(map[int32]parquet.Value, p.Dictionary().Len())
+		// Sparse reads often visit only a few entries of a large dictionary.
+		// Reuse the bounded cache across pages without sizing it to the dictionary.
+		if i.cachedSymbols == nil {
+			i.cachedSymbols = make(map[int32]parquet.Value)
+		} else {
+			clear(i.cachedSymbols)
+		}
 	} else {
+		i.cachedSymbols = nil
+		i.st.dict = nil
+		i.st.defs = nil
 		i.vr = p.Values()
 		if i.buffer != nil {
 			i.buffer = i.buffer[:0]
@@ -601,6 +616,7 @@ func (i *PageValueIterator) Reset(p parquet.Page) {
 		i.currentBufferIndex = -1
 	}
 	i.current = -1
+	i.err = nil
 }
 
 func (i *PageValueIterator) Err() error {
