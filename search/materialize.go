@@ -266,21 +266,33 @@ func (m *Materializer) filterBySeriesHash(ctx context.Context, rgi int, rr []Row
 		for row := r.From; row < r.From+r.Count; row++ {
 			v := values[idx]
 			idx++
-			if v.IsNull() || (v.Kind() != parquet.ByteArray && v.Kind() != parquet.FixedLenByteArray) || len(v.ByteArray()) != 8 {
+			hash, ok := decodeStableHash(v)
+			if !ok {
 				return rr, nil, false, nil
 			}
-			if !keep(binary.BigEndian.Uint64(v.ByteArray())) {
+			if !keep(hash) {
 				continue
 			}
 			hashes = append(hashes, v)
-			if n := len(filtered); n > 0 && filtered[n-1].From+filtered[n-1].Count == row {
-				filtered[n-1].Count++
-			} else {
-				filtered = append(filtered, RowRange{From: row, Count: 1})
-			}
+			filtered = appendRow(filtered, row)
 		}
 	}
 	return filtered, hashes, true, nil
+}
+
+func decodeStableHash(v parquet.Value) (uint64, bool) {
+	if v.IsNull() || (v.Kind() != parquet.ByteArray && v.Kind() != parquet.FixedLenByteArray) || len(v.ByteArray()) != 8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(v.ByteArray()), true
+}
+
+func appendRow(filtered []RowRange, row int64) []RowRange {
+	if n := len(filtered); n > 0 && filtered[n-1].From+filtered[n-1].Count == row {
+		filtered[n-1].Count++
+		return filtered
+	}
+	return append(filtered, RowRange{From: row, Count: 1})
 }
 
 func (m *Materializer) FilterSeriesLabels(ctx context.Context, hints *prom_storage.SelectHints, sLbls [][]labels.Label, rr []RowRange) ([]labels.Labels, []RowRange) {
