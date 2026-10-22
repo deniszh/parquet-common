@@ -169,11 +169,10 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		attribute.Int("row_ranges_count", len(rr)),
 	)
 
-	prepared, err := m.Prepare(ctx, hints, rgi, rr)
+	seriesSetLabels, rr, err := m.prepareLabels(ctx, hints, rgi, rr)
 	if err != nil {
 		return nil, err
 	}
-	seriesSetLabels, rr := preparedLabelsAndRanges(prepared)
 
 	if skipChunks {
 		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
@@ -194,8 +193,18 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 // without reading chunk pages. It applies the same row quota, stable-hash
 // filtering, label filtering, and projection handling as Materialize.
 func (m *Materializer) Prepare(ctx context.Context, hints *prom_storage.SelectHints, rgi int, rr []RowRange) ([]PreparedSeries, error) {
-	if err := m.checkRowCountQuota(rr); err != nil {
+	seriesSetLabels, rr, err := m.prepareLabels(ctx, hints, rgi, rr)
+	if err != nil {
 		return nil, err
+	}
+	return preparedSeries(seriesSetLabels, rr), nil
+}
+
+// prepareLabels materializes labels and their matching row ranges without
+// allocating PreparedSeries. It is shared by the direct and prepared paths.
+func (m *Materializer) prepareLabels(ctx context.Context, hints *prom_storage.SelectHints, rgi int, rr []RowRange) ([]labels.Labels, []RowRange, error) {
+	if err := m.checkRowCountQuota(rr); err != nil {
+		return nil, nil, err
 	}
 	labelsFilter, enabled := m.materializedLabelsFilterCallback(ctx, hints)
 	var hashes []parquet.Value
@@ -207,7 +216,7 @@ func (m *Materializer) Prepare(ctx context.Context, hints *prom_storage.SelectHi
 			var filtered bool
 			rr, hashes, filtered, err = m.filterBySeriesHash(ctx, rgi, rr, hashFilter.FilterHash)
 			if err != nil {
-				return nil, errors.Wrap(err, "error filtering series hashes")
+				return nil, nil, errors.Wrap(err, "error filtering series hashes")
 			}
 			if filtered {
 				labelsFilter = nil
@@ -226,7 +235,7 @@ func (m *Materializer) Prepare(ctx context.Context, hints *prom_storage.SelectHi
 	}
 	sLbls, err := m.materializeLabels(ctx, labelHints, rgi, rr, hashes)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error materializing labels")
+		return nil, nil, errors.Wrapf(err, "error materializing labels")
 	}
 
 	seriesSetLabels, rr := filterSeriesLabels(sLbls, rr, labelsFilter)
@@ -234,7 +243,7 @@ func (m *Materializer) Prepare(ctx context.Context, hints *prom_storage.SelectHi
 		seriesSetLabels = projectSeriesLabels(seriesSetLabels, hints)
 	}
 
-	return preparedSeries(seriesSetLabels, rr), nil
+	return seriesSetLabels, rr, nil
 }
 
 func preparedSeries(seriesLabels []labels.Labels, rr []RowRange) []PreparedSeries {
