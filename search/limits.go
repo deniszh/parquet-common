@@ -59,18 +59,31 @@ func UnlimitedQuota() *Quota {
 }
 
 func (q *Quota) Reserve(n int64) error {
-	if q.q == 0 {
-		return nil
-	}
-
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	if q.q == 0 {
+		q.u += n
+		return nil
+	}
 
 	if q.u-n < 0 {
 		return &resourceExhausted{used: q.q}
 	}
 	q.u -= n
 	return nil
+}
+
+// Used returns the amount successfully reserved from this quota. It is safe to
+// call while other goroutines are reserving quota.
+func (q *Quota) Used() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.q == 0 {
+		return q.u
+	}
+	return q.q - q.u
 }
 
 // QuotaLimitFunc is a function that returns the limit value.

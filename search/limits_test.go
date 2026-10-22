@@ -146,3 +146,16 @@ func TestQuota_ConcurrentReserve(t *testing.T) {
 	require.Error(t, err, "Expected error when reserving beyond quota limit")
 	require.True(t, IsResourceExhausted(err), "Expected resource exhausted error")
 }
+
+func TestQuota_Used(t *testing.T) {
+	limited := NewQuota(100)
+	require.NoError(t, limited.Reserve(40))
+	require.Equal(t, int64(40), limited.Used())
+	require.Error(t, limited.Reserve(70))
+	require.Equal(t, int64(40), limited.Used(), "failed reservations are not usage")
+
+	unlimited := UnlimitedQuota()
+	require.NoError(t, unlimited.Reserve(40))
+	require.NoError(t, unlimited.Reserve(60))
+	require.Equal(t, int64(100), unlimited.Used())
+}

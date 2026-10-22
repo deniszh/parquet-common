@@ -16,6 +16,7 @@ package search
 import (
 	"context"
 	"io"
+	"slices"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/parquet-go/parquet-go"
@@ -120,6 +121,66 @@ type FilterEmptyChunkSeriesSet struct {
 	materializedSeriesCallback MaterializedSeriesFunc
 	err                        error
 }
+
+// PreparedChunksSeriesSet pairs prepared labels with fetched chunks. Unlike
+// FilterEmptyChunkSeriesSet, it returns an empty series when no chunk overlaps
+// the requested time range, preserving the ordinal mapping to prepared rows.
+type PreparedChunksSeriesSet struct {
+	ctx      context.Context
+	labels   []labels.Labels
+	chunks   ChunksIteratorIterator
+	current  int
+	series   *ConcreteChunksSeries
+	callback MaterializedSeriesFunc
+	err      error
+}
+
+func NewPreparedChunksSeriesSet(ctx context.Context, labels []labels.Labels, chunks ChunksIteratorIterator, callback MaterializedSeriesFunc) *PreparedChunksSeriesSet {
+	return &PreparedChunksSeriesSet{ctx: ctx, labels: labels, chunks: chunks, current: -1, callback: callback}
+}
+
+func (s *PreparedChunksSeriesSet) At() prom_storage.ChunkSeries { return s.series }
+
+func (s *PreparedChunksSeriesSet) Next() bool {
+	if s.err != nil || s.current+1 == len(s.labels) {
+		return false
+	}
+	if !s.chunks.Next() {
+		if err := s.chunks.Err(); err != nil {
+			s.err = err
+		} else {
+			s.err = errors.New("more labels than chunks, this should not happen")
+		}
+		return false
+	}
+	metas := make([]chunks.Meta, 0, 128)
+	iter := s.chunks.At()
+	for iter.Next() {
+		metas = append(metas, iter.At())
+	}
+	if err := iter.Err(); err != nil {
+		s.err = err
+		return false
+	}
+	s.current++
+	s.series = &ConcreteChunksSeries{lbls: s.labels[s.current], chks: slices.Clone(metas)}
+	s.err = s.callback(s.ctx, s.series)
+	return s.err == nil
+}
+
+func (s *PreparedChunksSeriesSet) Err() error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.current+1 == len(s.labels) && s.chunks.Next() {
+		return errors.New("more chunks than labels, this should not happen")
+	}
+	return s.chunks.Err()
+}
+
+func (s *PreparedChunksSeriesSet) Warnings() annotations.Annotations { return nil }
+
+func (s *PreparedChunksSeriesSet) Close() error { return s.chunks.Close() }
 
 func NewFilterEmptyChunkSeriesSet(
 	ctx context.Context,

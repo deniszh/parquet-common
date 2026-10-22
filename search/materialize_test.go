@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,121 @@ import (
 	"github.com/prometheus-community/parquet-common/storage"
 	"github.com/prometheus-community/parquet-common/util"
 )
+
+type observedChunksFile struct {
+	storage.ParquetFileView
+	reads *atomic.Int32
+}
+
+func (f observedChunksFile) GetPages(ctx context.Context, cc parquet.ColumnChunk, minOffset, maxOffset int64) (parquet.Pages, error) {
+	f.reads.Add(1)
+	return f.ParquetFileView.GetPages(ctx, cc, minOffset, maxOffset)
+}
+
+type observedChunksShard struct {
+	storage.ParquetShard
+	reads *atomic.Int32
+}
+
+func (s observedChunksShard) ChunksFile() storage.ParquetFileView {
+	return observedChunksFile{ParquetFileView: s.ParquetShard.ChunksFile(), reads: s.reads}
+}
+
+func TestPrepareAndMaterializePreparedChunks(t *testing.T) {
+	ctx := context.Background()
+	st := teststorage.New(t)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	bkt, err := filesystem.NewBucket(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bkt.Close()) })
+	data := util.GenerateTestData(t, st, ctx, util.TestConfig{TotalMetricNames: 1, MetricsPerMetricName: 8, NumberOfLabels: 2, RandomLabels: 1, NumberOfSamples: 8})
+	shard := convertToParquet(t, ctx, bkt, data, st.Head())
+	var chunkReads atomic.Int32
+	observed := observedChunksShard{ParquetShard: shard, reads: &chunkReads}
+	s, err := observed.TSDBSchema()
+	require.NoError(t, err)
+	m, err := NewMaterializer(s, schema.NewPrometheusParquetChunksDecoder(chunkenc.NewPool()), observed, 4, UnlimitedQuota(), UnlimitedQuota(), UnlimitedQuota(), NoopMaterializedSeriesFunc, NoopMaterializedLabelsFilterCallback, false)
+	require.NoError(t, err)
+	rr := []RowRange{{From: 0, Count: shard.LabelsFile().RowGroups()[0].NumRows()}}
+
+	prepared, err := m.Prepare(ctx, nil, 0, rr)
+	require.NoError(t, err)
+	require.Len(t, prepared, 8)
+	require.Zero(t, chunkReads.Load(), "preparing labels must not fetch chunk pages")
+
+	actual := make([]*ConcreteChunksSeries, 0, len(prepared))
+	for _, batch := range [][]PreparedSeries{prepared[:3], prepared[3:]} {
+		set, err := m.MaterializePreparedChunks(ctx, 0, data.MinTime, data.MaxTime, batch)
+		require.NoError(t, err)
+		actual = append(actual, collectConcreteChunks(t, set)...)
+		require.NoError(t, set.Close())
+	}
+	require.Positive(t, chunkReads.Load(), "fetching a prepared batch must read chunk pages")
+
+	direct, err := m.Materialize(ctx, nil, 0, data.MinTime, data.MaxTime, false, rr)
+	require.NoError(t, err)
+	expected := collectConcreteChunks(t, direct)
+	require.NoError(t, direct.Close())
+	require.Equal(t, expected, actual, "bounded prepared batches preserve the direct result")
+
+	empty, err := m.MaterializePreparedChunks(ctx, 0, data.MaxTime+1, data.MaxTime+1, prepared[:2])
+	require.NoError(t, err)
+	emptySeries := collectConcreteChunks(t, empty)
+	require.Len(t, emptySeries, 2, "empty chunk results retain the prepared ordinal")
+	for _, series := range emptySeries {
+		require.Empty(t, series.chks)
+	}
+	require.NoError(t, empty.Close())
+
+	readsBeforeEmpty := chunkReads.Load()
+	emptyBatch, err := m.MaterializePreparedChunks(ctx, 0, data.MinTime, data.MaxTime, nil)
+	require.NoError(t, err)
+	require.Empty(t, collectConcreteChunks(t, emptyBatch))
+	require.NoError(t, emptyBatch.Close())
+	require.Equal(t, readsBeforeEmpty, chunkReads.Load(), "an empty prepared batch must not fetch chunk pages")
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = m.Prepare(cancelled, nil, 0, rr)
+	require.ErrorIs(t, err, context.Canceled)
+
+	limited, err := NewMaterializer(s, schema.NewPrometheusParquetChunksDecoder(chunkenc.NewPool()), observed, 4, NewQuota(1), UnlimitedQuota(), UnlimitedQuota(), NoopMaterializedSeriesFunc, NoopMaterializedLabelsFilterCallback, false)
+	require.NoError(t, err)
+	_, err = limited.Prepare(ctx, nil, 0, rr)
+	require.ErrorContains(t, err, "would fetch too many rows")
+}
+
+func TestPrepareFallsBackToLabelsWhenStoredHashIsUnavailable(t *testing.T) {
+	shard, _ := hashFilterFixture(t, 2)
+	filter := &testHashFilter{shard: 0, count: 4}
+	m := hashFilterMaterializer(t, noHashShard{ParquetShard: shard}, filter, false)
+	prepared, err := m.Prepare(context.Background(), nil, 0, []RowRange{{From: 0, Count: 128}})
+	require.NoError(t, err)
+	require.NotEmpty(t, prepared)
+	require.Zero(t, filter.hashCalls, "an unavailable stored hash must not determine ownership")
+	require.Equal(t, 128, filter.labelsCalls, "fallback filters full labels")
+	require.Equal(t, 1, filter.closes)
+	for _, series := range prepared {
+		require.Equal(t, uint64(0), labels.StableHash(series.Labels)%4)
+	}
+}
+
+func collectConcreteChunks(t testing.TB, set ChunkSeriesSetCloser) []*ConcreteChunksSeries {
+	t.Helper()
+	result := make([]*ConcreteChunksSeries, 0)
+	for set.Next() {
+		series := set.At()
+		concrete := &ConcreteChunksSeries{lbls: series.Labels()}
+		iterator := series.Iterator(nil)
+		for iterator.Next() {
+			concrete.chks = append(concrete.chks, iterator.At())
+		}
+		require.NoError(t, iterator.Err())
+		result = append(result, concrete)
+	}
+	require.NoError(t, set.Err())
+	return result
+}
 
 func TestNoChunksConcreteLabelsSeriesSetCallsMaterializedSeriesCallback(t *testing.T) {
 	wantErr := errors.New("limit exceeded")

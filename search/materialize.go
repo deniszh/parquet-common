@@ -59,6 +59,15 @@ type Materializer struct {
 	honorProjectionHints bool
 }
 
+// PreparedSeries identifies a label set and its row in a Parquet row group.
+// It is returned by Prepare and can be supplied to MaterializePreparedChunks.
+// A PreparedSeries is valid only for the row group and Materializer that
+// created it.
+type PreparedSeries struct {
+	Labels labels.Labels
+	Row    int64
+}
+
 // MaterializedSeriesFunc is a callback function that can be used to add limiter or statistic logics for
 // materialized series.
 type MaterializedSeriesFunc func(ctx context.Context, series prom_storage.ChunkSeries) error
@@ -160,13 +169,38 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		attribute.Int("row_ranges_count", len(rr)),
 	)
 
+	prepared, err := m.Prepare(ctx, hints, rgi, rr)
+	if err != nil {
+		return nil, err
+	}
+	seriesSetLabels, rr := preparedLabelsAndRanges(prepared)
+
+	if skipChunks {
+		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
+	}
+
+	chksIter, err := m.MaterializeChunks(ctx, rgi, mint, maxt, rr)
+	if err != nil {
+		return nil, errors.Wrap(err, "materializer failed to create chunks iterator")
+	}
+
+	seriesSetIter := NewFilterEmptyChunkSeriesSet(ctx, seriesSetLabels, chksIter, m.materializedSeriesCallback)
+
+	span.SetAttributes(attribute.Int("materialized_series_count", len(seriesSetLabels)))
+	return seriesSetIter, nil
+}
+
+// Prepare materializes the labels and row references for matching series
+// without reading chunk pages. It applies the same row quota, stable-hash
+// filtering, label filtering, and projection handling as Materialize.
+func (m *Materializer) Prepare(ctx context.Context, hints *prom_storage.SelectHints, rgi int, rr []RowRange) ([]PreparedSeries, error) {
 	if err := m.checkRowCountQuota(rr); err != nil {
-		span.SetAttributes(attribute.String("quota_failure", "row_count"))
 		return nil, err
 	}
 	labelsFilter, enabled := m.materializedLabelsFilterCallback(ctx, hints)
 	var hashes []parquet.Value
 	projectAfterFiltering := false
+	var err error
 	if enabled {
 		defer labelsFilter.Close()
 		if hashFilter, ok := labelsFilter.(MaterializedSeriesHashFilter); ok {
@@ -200,19 +234,56 @@ func (m *Materializer) Materialize(ctx context.Context, hints *prom_storage.Sele
 		seriesSetLabels = projectSeriesLabels(seriesSetLabels, hints)
 	}
 
-	if skipChunks {
-		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesSetLabels, m.materializedSeriesCallback), nil
-	}
+	return preparedSeries(seriesSetLabels, rr), nil
+}
 
+func preparedSeries(seriesLabels []labels.Labels, rr []RowRange) []PreparedSeries {
+	prepared := make([]PreparedSeries, 0, len(seriesLabels))
+	labelIndex := 0
+	for _, rowRange := range rr {
+		for row := rowRange.From; row < rowRange.From+rowRange.Count; row++ {
+			prepared = append(prepared, PreparedSeries{Labels: seriesLabels[labelIndex], Row: row})
+			labelIndex++
+		}
+	}
+	return prepared
+}
+
+func preparedLabelsAndRanges(prepared []PreparedSeries) ([]labels.Labels, []RowRange) {
+	seriesLabels := make([]labels.Labels, len(prepared))
+	rr := make([]RowRange, 0, len(prepared))
+	for i, series := range prepared {
+		seriesLabels[i] = series.Labels
+		rr = appendRow(rr, series.Row)
+	}
+	return seriesLabels, rr
+}
+
+// MaterializePreparedChunks fetches chunks for a bounded batch returned by
+// Prepare. It yields one series for every prepared row, including series with
+// no chunks in the requested time range, so callers can keep label and chunk
+// phases aligned. Prepared rows must be strictly increasing.
+func (m *Materializer) MaterializePreparedChunks(ctx context.Context, rgi int, mint, maxt int64, prepared []PreparedSeries) (ChunkSeriesSetCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(prepared) == 0 {
+		return newNoChunksConcreteLabelsSeriesSet(ctx, nil, m.materializedSeriesCallback), nil
+	}
+	for i, series := range prepared {
+		if series.Row < 0 || (i > 0 && prepared[i-1].Row >= series.Row) {
+			return nil, fmt.Errorf("prepared rows must be strictly increasing and non-negative")
+		}
+	}
+	seriesLabels, rr := preparedLabelsAndRanges(prepared)
+	if mint > maxt || maxt < m.s.MinTs || mint > m.s.MaxTs {
+		return newNoChunksConcreteLabelsSeriesSet(ctx, seriesLabels, m.materializedSeriesCallback), nil
+	}
 	chksIter, err := m.MaterializeChunks(ctx, rgi, mint, maxt, rr)
 	if err != nil {
 		return nil, errors.Wrap(err, "materializer failed to create chunks iterator")
 	}
-
-	seriesSetIter := NewFilterEmptyChunkSeriesSet(ctx, seriesSetLabels, chksIter, m.materializedSeriesCallback)
-
-	span.SetAttributes(attribute.Int("materialized_series_count", len(seriesSetLabels)))
-	return seriesSetIter, nil
+	return NewPreparedChunksSeriesSet(ctx, seriesLabels, chksIter, m.materializedSeriesCallback), nil
 }
 
 func projectSeriesLabels(series []labels.Labels, hints *prom_storage.SelectHints) []labels.Labels {
